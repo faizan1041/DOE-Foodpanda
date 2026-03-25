@@ -1,0 +1,19 @@
+# Environment and credentials
+.env
+credentials.json
+token.json
+
+# Temp files
+.tmp/
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Node
+node_modules/
