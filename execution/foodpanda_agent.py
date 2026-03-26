@@ -15,6 +15,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from foodpanda_browser import FoodpandaBrowser
+import lunch_db
 
 load_dotenv()
 
@@ -24,7 +25,7 @@ TMP_DIR.mkdir(exist_ok=True)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-SYSTEM_PROMPT = """You are a friendly food ordering assistant for Foodpanda Pakistan. You help users find and order food.
+SYSTEM_PROMPT = """You are a friendly food ordering assistant for Foodpanda Pakistan. You help users find and order food. You also act as a proactive daily lunch assistant that tracks orders and makes smart suggestions.
 
 Your job is to have a natural conversation to understand what the user wants, then output a structured JSON action when you have enough information.
 
@@ -33,6 +34,7 @@ Your job is to have a natural conversation to understand what the user wants, th
 2. When you have enough info, output a JSON action block that the system will execute
 3. After the system executes (searches restaurants, loads menus, etc.), you'll get the results and present them nicely to the user
 4. Continue the conversation until the user is ready to order
+5. After the user picks a restaurant and browses the menu, proactively ask what they ended up ordering so you can log it for future suggestions
 
 ## Information you need to collect (in any order, through natural conversation):
 - **Cuisine/food type**: What they're in the mood for (desi, chinese, pizza, burgers, biryani, BBQ, etc.)
@@ -46,17 +48,32 @@ When you're ready to execute an action, include a JSON block in your response wr
 
 ### Search restaurants:
 ```json
-{"action": "search_restaurants", "cuisine": "pizza", "location": "F-7 Islamabad", "people": 3}
+{{"action": "search_restaurants", "cuisine": "pizza", "location": "F-7 Islamabad", "people": 3}}
 ```
 
 ### Load a restaurant's menu (after showing search results):
 ```json
-{"action": "load_menu", "restaurant_index": 1}
+{{"action": "load_menu", "restaurant_index": 1}}
 ```
 
 ### Open restaurant in browser for ordering:
 ```json
-{"action": "open_browser", "restaurant_index": 1}
+{{"action": "open_browser", "restaurant_index": 1}}
+```
+
+### Log an order (after user tells you what they ordered):
+```json
+{{"action": "log_order", "restaurant_name": "Savour Foods", "restaurant_code": "s2hg", "items": ["Chicken Biryani", "Raita"], "cuisine": "Pakistani"}}
+```
+
+### Blacklist a restaurant (when user says never suggest a place again):
+```json
+{{"action": "blacklist_restaurant", "restaurant_name": "Bad Restaurant", "restaurant_code": "xxxx", "reason": "food quality was poor"}}
+```
+
+### Show today's pre-computed lunch suggestions:
+```json
+{{"action": "show_today_suggestions"}}
 ```
 
 ## Rules:
@@ -67,10 +84,14 @@ When you're ready to execute an action, include a JSON block in your response wr
 - When showing menus, organize by category and highlight prices
 - Calculate total cost and per-person cost when the user selects items
 - When the user is ready to order, generate the open_browser action
+- After opening the browser for ordering, ask the user what they ended up ordering so you can track it
 - If a search returns no results, suggest alternatives
 - Understand Urdu/Roman Urdu mixed with English (common in Pakistan)
 - Know Pakistani food well: desi = Pakistani/karahi/biryani/nihari, "khaana" = food, "kitne log" = how many people
 - Parse locations smartly: "I-10" = I-10 Islamabad, "gulberg" = Gulberg Lahore, "DHA" could be multiple cities so ask which one
+- If the user mentions a bad experience at a restaurant, offer to blacklist it
+- When suggesting restaurants, mention if the user hasn't tried a place before or hasn't had that cuisine recently
+- If today's lunch suggestions are available, show them when the user opens the chat around lunch time
 
 ## Current state:
 {state_context}
@@ -78,11 +99,16 @@ When you're ready to execute an action, include a JSON block in your response wr
 
 
 class FoodpandaAgent:
-    """LLM-powered conversational food ordering agent."""
+    """Food ordering agent with deterministic lunch flow + optional LLM for general chat."""
+
+    # Lunch flow states
+    LUNCH_IDLE = "idle"
+    LUNCH_AWAITING_PICK = "awaiting_pick"       # Showed suggestions, waiting for restaurant number
+    LUNCH_AWAITING_ORDER = "awaiting_order"      # User picked restaurant, waiting for what they ordered
+    LUNCH_AWAITING_BLACKLIST = "awaiting_blacklist"  # Asked if they want to blacklist
 
     def __init__(self):
         self.browser = FoodpandaBrowser()
-        self.llm = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.conversation = []  # Full message history for the LLM
         self.restaurants = []
         self.menu_items = []
@@ -91,6 +117,12 @@ class FoodpandaAgent:
         self.cuisine = None
         self.location = None
         self.people_count = None
+        self.lunch_state = self.LUNCH_IDLE
+        self._has_llm = bool(ANTHROPIC_API_KEY)
+        if self._has_llm:
+            self.llm = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        else:
+            self.llm = None
 
     async def start(self):
         await self.browser.start()
@@ -99,49 +131,224 @@ class FoodpandaAgent:
         await self.browser.close()
 
     async def handle_message(self, user_message: str) -> list[dict]:
-        """Process user message through LLM and execute any actions."""
+        """Process user message - deterministic lunch flow first, LLM fallback for general chat."""
         responses = []
+        msg = user_message.strip()
 
-        # First message triggers greeting
-        if not self.conversation and not user_message.strip():
-            greeting = self._call_llm("The user just opened the chat. Greet them warmly and ask what they'd like to eat today. Keep it short and friendly.")
-            responses.append({"type": "text", "content": greeting})
-            return responses
+        # ── First message: show today's suggestions or greeting ──
+        if not self.conversation and not msg:
+            today_suggestions = lunch_db.get_today_suggestions()
+            if today_suggestions:
+                self.restaurants = today_suggestions
+                self.location = lunch_db.get_config("default_location", "I-10 Islamabad")
+                self.lunch_state = self.LUNCH_AWAITING_PICK
 
-        # Add user message to conversation
-        if user_message.strip():
-            self.conversation.append({"role": "user", "content": user_message})
+                # Build recent orders context
+                recent = lunch_db.get_recent_orders(days=4)
+                recent_text = ""
+                if recent:
+                    recent_names = [o["restaurant_name"] for o in recent[:4]]
+                    recent_text = f"\n\nYou recently ordered from: {', '.join(recent_names)}"
 
-        # Build state context for the LLM
-        state = self._build_state_context()
+                responses.append({
+                    "type": "text",
+                    "content": f"Hey! Your lunch picks for today are ready 🍽️{recent_text}\n\nPick a number to see the menu, or type **'order [number]'** to open it directly:"
+                })
+                responses.append({"type": "restaurants", "content": today_suggestions[:5]})
+                return responses
+            else:
+                responses.append({
+                    "type": "text",
+                    "content": "Hey! What are you in the mood for today? Tell me a cuisine and your area, and I'll find the best spots for you."
+                })
+                return responses
 
-        # Call LLM
-        llm_response = self._call_llm_with_history(state)
+        # ── Deterministic lunch flow ──
+        lunch_response = await self._handle_lunch_flow(msg)
+        if lunch_response is not None:
+            return lunch_response
 
-        # Parse response for actions and text
-        text_parts, actions = self._parse_response(llm_response)
+        # ── Fallback: LLM-powered general chat (if API key available) ──
+        if self._has_llm:
+            if msg:
+                self.conversation.append({"role": "user", "content": msg})
+            state = self._build_state_context()
+            llm_response = self._call_llm_with_history(state)
+            text_parts, actions = self._parse_response(llm_response)
+            self.conversation.append({"role": "assistant", "content": llm_response})
 
-        # Add LLM response to conversation history
-        self.conversation.append({"role": "assistant", "content": llm_response})
-
-        # Send any text before the action
-        if text_parts["before"]:
-            responses.append({"type": "text", "content": text_parts["before"]})
-
-        # Execute actions
-        for action in actions:
-            action_responses = await self._execute_action(action)
-            responses.extend(action_responses)
-
-        # Send any text after the action
-        if text_parts["after"]:
-            responses.append({"type": "text", "content": text_parts["after"]})
-
-        # If no text was generated (shouldn't happen), add the full response
-        if not responses:
-            responses.append({"type": "text", "content": llm_response})
+            if text_parts["before"]:
+                responses.append({"type": "text", "content": text_parts["before"]})
+            for action in actions:
+                action_responses = await self._execute_action(action)
+                responses.extend(action_responses)
+            if text_parts["after"]:
+                responses.append({"type": "text", "content": text_parts["after"]})
+            if not responses:
+                responses.append({"type": "text", "content": llm_response})
+        else:
+            # No LLM available - handle basic commands deterministically
+            responses = await self._handle_basic_command(msg)
 
         return responses
+
+    async def _handle_lunch_flow(self, msg: str) -> list[dict] | None:
+        """Handle the deterministic lunch flow. Returns None if not a lunch command."""
+        msg_lower = msg.lower().strip()
+
+        # ── Blacklist commands (work in any state) ──
+        if msg_lower.startswith("blacklist ") or msg_lower.startswith("never suggest "):
+            name = msg.split(" ", 1)[1] if msg_lower.startswith("blacklist ") else msg.split("suggest ", 1)[1]
+            # Try to match against current restaurants
+            matched = self._match_restaurant(name)
+            if matched:
+                lunch_db.blacklist_restaurant(matched["name"], matched.get("code", ""), "user requested")
+                return [{"type": "text", "content": f"Done! **{matched['name']}** has been blacklisted. I won't suggest it again."}]
+            else:
+                lunch_db.blacklist_restaurant(name.strip(), "", "user requested")
+                return [{"type": "text", "content": f"Done! **{name.strip()}** has been blacklisted."}]
+
+        # ── Show history ──
+        if msg_lower in ("history", "order history", "past orders"):
+            orders = lunch_db.get_recent_orders(days=30)
+            if not orders:
+                return [{"type": "text", "content": "No order history yet!"}]
+            lines = ["**Your recent orders:**\n"]
+            for o in orders[:15]:
+                items_str = ", ".join(o["items"]) if o.get("items") else "not specified"
+                lines.append(f"- **{o['order_date']}**: {o['restaurant_name']} ({items_str})")
+            return [{"type": "text", "content": "\n".join(lines)}]
+
+        # ── Show blacklist ──
+        if msg_lower in ("blacklist", "show blacklist", "blocked"):
+            bl = lunch_db.get_blacklist()
+            if not bl:
+                return [{"type": "text", "content": "No blacklisted restaurants."}]
+            lines = ["**Blacklisted restaurants:**\n"]
+            for b in bl:
+                lines.append(f"- {b['restaurant_name']}: {b.get('reason', 'no reason')}")
+            return [{"type": "text", "content": "\n".join(lines)}]
+
+        # ── State: Awaiting restaurant pick ──
+        if self.lunch_state == self.LUNCH_AWAITING_PICK:
+            # Check if user typed a number
+            num = self._extract_number(msg_lower)
+
+            # "order 3" or "open 3" — open directly in browser
+            if msg_lower.startswith("order") or msg_lower.startswith("open"):
+                parts = msg_lower.split()
+                if len(parts) >= 2:
+                    num = self._extract_number(parts[1])
+                if num and 1 <= num <= len(self.restaurants):
+                    idx = num - 1
+                    self.selected_restaurant = self.restaurants[idx]
+                    url = self.selected_restaurant.get("url", "https://www.foodpanda.pk")
+                    await self.browser.start()
+                    self.browser.current_vendor_code = self.selected_restaurant.get("code", "")
+                    await self.browser.proceed_to_checkout()
+                    self.lunch_state = self.LUNCH_AWAITING_ORDER
+                    return [{"type": "text", "content": f"Opening **{self.selected_restaurant['name']}** in your browser!\n\n🔗 {url}\n\nOnce you've ordered, tell me what you got so I can save it! Just type the items (e.g. \"chicken biryani, raita\")"}]
+
+            # Just a number — show menu
+            if num and 1 <= num <= len(self.restaurants):
+                idx = num - 1
+                self.selected_restaurant = self.restaurants[idx]
+                url = self.selected_restaurant.get("url", "")
+                await self.browser.start()
+                await self.browser.set_location(self.location or "I-10 Islamabad")
+                menu_items = await self.browser.scrape_restaurant_menu(url)
+                self.menu_items = menu_items
+
+                responses = []
+                if menu_items:
+                    responses.append({
+                        "type": "text",
+                        "content": f"Here's the menu for **{self.selected_restaurant['name']}**:"
+                    })
+                    responses.append({
+                        "type": "menu",
+                        "content": {"restaurant": self.selected_restaurant["name"], "items": menu_items[:30]},
+                    })
+                    responses.append({
+                        "type": "text",
+                        "content": f"Type **'order {num}'** to open it in Foodpanda, or pick another number."
+                    })
+                else:
+                    responses.append({
+                        "type": "text",
+                        "content": f"Couldn't load the menu for **{self.selected_restaurant['name']}**.\n\nType **'order {num}'** to open it directly on Foodpanda."
+                    })
+                return responses
+
+            # Not a number — don't handle, let it fall through
+            return None
+
+        # ── State: Awaiting what they ordered ──
+        if self.lunch_state == self.LUNCH_AWAITING_ORDER:
+            if msg_lower in ("skip", "nothing", "cancel", "nevermind"):
+                self.lunch_state = self.LUNCH_IDLE
+                return [{"type": "text", "content": "No worries! Your order wasn't logged."}]
+
+            # Parse items from the message (comma-separated or just the whole message)
+            items = [item.strip() for item in msg.split(",") if item.strip()]
+            if not items:
+                items = [msg]
+
+            restaurant_name = self.selected_restaurant["name"] if self.selected_restaurant else "Unknown"
+            restaurant_code = self.selected_restaurant.get("code", "") if self.selected_restaurant else ""
+            cuisines = self.selected_restaurant.get("cuisines", []) if self.selected_restaurant else []
+            cuisine = cuisines[0] if cuisines else ""
+
+            lunch_db.save_order(
+                restaurant_name=restaurant_name,
+                restaurant_code=restaurant_code,
+                items=items,
+                cuisine=cuisine,
+            )
+            lunch_db.mark_suggestion_picked(restaurant_name)
+            self.lunch_state = self.LUNCH_IDLE
+            print(f"[agent] Order logged: {restaurant_name} - {items}")
+
+            return [{"type": "text", "content": f"Got it! Logged your order from **{restaurant_name}**: {', '.join(items)}\n\nI'll factor this into tomorrow's suggestions. Enjoy your meal!"}]
+
+        return None
+
+    async def _handle_basic_command(self, msg: str) -> list[dict]:
+        """Handle basic commands without LLM."""
+        msg_lower = msg.lower().strip()
+
+        # Search command
+        if any(msg_lower.startswith(kw) for kw in ["search", "find", "show me"]):
+            return [{"type": "text", "content": "To search, I need your area and what you're craving. For example: **'pizza in I-10 Islamabad'**"}]
+
+        # Trigger suggestions
+        if msg_lower in ("suggestions", "suggest", "lunch", "what should i eat"):
+            suggestions = lunch_db.get_today_suggestions()
+            if suggestions:
+                self.restaurants = suggestions
+                self.lunch_state = self.LUNCH_AWAITING_PICK
+                return [
+                    {"type": "text", "content": "Here are today's picks! Type a number to see the menu:"},
+                    {"type": "restaurants", "content": suggestions[:5]},
+                ]
+            return [{"type": "text", "content": "No suggestions ready yet. Use **/api/trigger-lunch-search** to generate them, or tell me what cuisine you want!"}]
+
+        return [{"type": "text", "content": "I can help you with lunch! Try:\n- **'suggestions'** — see today's picks\n- **'history'** — see past orders\n- **'blacklist [name]'** — block a restaurant\n- Or just tell me what you're craving!"}]
+
+    def _extract_number(self, text: str) -> int | None:
+        """Extract a number from text."""
+        match = re.match(r'^(\d+)$', text.strip())
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _match_restaurant(self, name: str) -> dict | None:
+        """Try to match a name against current restaurant list."""
+        name_lower = name.lower().strip()
+        for r in self.restaurants:
+            if name_lower in r["name"].lower():
+                return r
+        return None
 
     # ── LLM Calls ──────────────────────────────────────────────────────
 
@@ -204,6 +411,30 @@ class FoodpandaAgent:
             total = sum(i.get("price", 0) * i["quantity"] for i in self.cart)
             parts.append(f"Cart:\n{cart_lines}\n  Total: Rs. {total:,}")
 
+        # Order history (last 7 days)
+        recent_orders = lunch_db.get_recent_orders(days=7)
+        if recent_orders:
+            order_lines = []
+            for o in recent_orders[:10]:
+                items_str = ", ".join(o["items"]) if o.get("items") else "unknown items"
+                order_lines.append(f"  {o['order_date']}: {o['restaurant_name']} ({items_str})")
+            parts.append(f"Recent orders (last 7 days):\n" + "\n".join(order_lines))
+
+        # Blacklist
+        blacklist = lunch_db.get_blacklist()
+        if blacklist:
+            bl_lines = [f"  - {b['restaurant_name']}: {b.get('reason', 'no reason given')}" for b in blacklist[:10]]
+            parts.append(f"Blacklisted restaurants:\n" + "\n".join(bl_lines))
+
+        # Today's suggestions
+        today_suggestions = lunch_db.get_today_suggestions()
+        if today_suggestions:
+            sug_lines = []
+            for i, s in enumerate(today_suggestions[:5], 1):
+                deal_tag = f" | {s['deal']}" if s.get("deal") else ""
+                sug_lines.append(f"  {i}. {s['name']} - ⭐{s.get('rating', '?')} - {s.get('delivery_time', '?')}{deal_tag} (score: {s.get('score', '?')})")
+            parts.append(f"Today's lunch suggestions (pre-computed):\n" + "\n".join(sug_lines))
+
         return "\n".join(parts) if parts else "No information collected yet."
 
     # ── Response Parsing ───────────────────────────────────────────────
@@ -251,6 +482,12 @@ class FoodpandaAgent:
             responses = await self._do_load_menu(action)
         elif action_type == "open_browser":
             responses = await self._do_open_browser(action)
+        elif action_type == "log_order":
+            responses = self._do_log_order(action)
+        elif action_type == "blacklist_restaurant":
+            responses = self._do_blacklist(action)
+        elif action_type == "show_today_suggestions":
+            responses = self._do_show_suggestions()
 
         # Feed results back to LLM for natural presentation
         if responses:
@@ -351,3 +588,55 @@ class FoodpandaAgent:
         })
 
         return responses
+
+    def _do_log_order(self, action: dict) -> list[dict]:
+        """Log an order to the database."""
+        restaurant_name = action.get("restaurant_name", "")
+        if not restaurant_name and self.selected_restaurant:
+            restaurant_name = self.selected_restaurant.get("name", "Unknown")
+
+        restaurant_code = action.get("restaurant_code", "")
+        if not restaurant_code and self.selected_restaurant:
+            restaurant_code = self.selected_restaurant.get("code", "")
+
+        items = action.get("items", [])
+        cuisine = action.get("cuisine", "")
+
+        lunch_db.save_order(
+            restaurant_name=restaurant_name,
+            restaurant_code=restaurant_code,
+            items=items if items else None,
+            cuisine=cuisine if cuisine else None,
+        )
+        lunch_db.mark_suggestion_picked(restaurant_name)
+        print(f"[agent] Order logged: {restaurant_name} - {items}")
+        return []
+
+    def _do_blacklist(self, action: dict) -> list[dict]:
+        """Blacklist a restaurant."""
+        restaurant_name = action.get("restaurant_name", "")
+        if not restaurant_name and self.selected_restaurant:
+            restaurant_name = self.selected_restaurant.get("name", "Unknown")
+
+        restaurant_code = action.get("restaurant_code", "")
+        if not restaurant_code and self.selected_restaurant:
+            restaurant_code = self.selected_restaurant.get("code", "")
+
+        reason = action.get("reason", "")
+
+        lunch_db.blacklist_restaurant(
+            restaurant_name=restaurant_name,
+            restaurant_code=restaurant_code,
+            reason=reason,
+        )
+        print(f"[agent] Blacklisted: {restaurant_name} - {reason}")
+        return []
+
+    def _do_show_suggestions(self) -> list[dict]:
+        """Show today's pre-computed lunch suggestions."""
+        suggestions = lunch_db.get_today_suggestions()
+        if not suggestions:
+            return [{"type": "text", "content": "No lunch suggestions ready yet for today. Want me to search for restaurants now?"}]
+
+        self.restaurants = suggestions
+        return [{"type": "restaurants", "content": suggestions}]

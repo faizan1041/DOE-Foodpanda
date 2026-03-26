@@ -21,7 +21,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from foodpanda_agent import FoodpandaAgent
+import lunch_db
+from lunch_scheduler import run_daily_lunch_search
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +52,29 @@ def cleanup_stale_sessions():
 # App
 # ---------------------------------------------------------------------------
 
+scheduler = AsyncIOScheduler()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize default config if not set
+    if not lunch_db.get_config("default_location"):
+        lunch_db.save_config("default_location", "I-10 Islamabad")
+
+    # Schedule daily lunch search at 12:30 PM PKT (Asia/Karachi = UTC+5)
+    scheduler.add_job(
+        run_daily_lunch_search,
+        CronTrigger(hour=12, minute=30, timezone="Asia/Karachi"),
+        id="daily_lunch_search",
+        name="Daily lunch restaurant search",
+        replace_existing=True,
+    )
+    scheduler.start()
+    print("[scheduler] Daily lunch search scheduled for 12:30 PM PKT")
+
     yield
+
+    scheduler.shutdown(wait=False)
     sessions.clear()
 
 
@@ -143,6 +168,66 @@ async def reverse_geocode(lat: float, lng: float):
             return JSONResponse({"location": location, "full_address": data.get("display_name", "")})
     except Exception as e:
         return JSONResponse({"location": None, "error": str(e)}, status_code=500)
+
+
+class ConfigRequest(BaseModel):
+    key: str
+    value: str
+
+
+class BlacklistRequest(BaseModel):
+    restaurant_name: str
+    restaurant_code: str = ""
+    reason: str = ""
+
+
+@app.get("/api/suggestions/today")
+async def get_today_suggestions():
+    """Get today's pre-computed lunch suggestions."""
+    suggestions = lunch_db.get_today_suggestions()
+    return JSONResponse({"suggestions": suggestions or [], "date": datetime.now(timezone.utc).date().isoformat()})
+
+
+@app.get("/api/history")
+async def get_order_history(days: int = 30):
+    """Get recent order history."""
+    orders = lunch_db.get_recent_orders(days=days)
+    return JSONResponse({"orders": orders})
+
+
+@app.post("/api/config")
+async def save_config(req: ConfigRequest):
+    """Save a user config value."""
+    lunch_db.save_config(req.key, req.value)
+    return JSONResponse({"status": "ok", "key": req.key, "value": req.value})
+
+
+@app.get("/api/config")
+async def get_config():
+    """Get all user config."""
+    config = lunch_db.get_all_config()
+    return JSONResponse({"config": config})
+
+
+@app.post("/api/blacklist")
+async def add_to_blacklist(req: BlacklistRequest):
+    """Blacklist a restaurant."""
+    lunch_db.blacklist_restaurant(req.restaurant_name, req.restaurant_code, req.reason)
+    return JSONResponse({"status": "ok", "blacklisted": req.restaurant_name})
+
+
+@app.get("/api/blacklist")
+async def get_blacklist():
+    """Get all blacklisted restaurants."""
+    blacklist = lunch_db.get_blacklist()
+    return JSONResponse({"blacklist": blacklist})
+
+
+@app.post("/api/trigger-lunch-search")
+async def trigger_lunch_search():
+    """Manually trigger the daily lunch search (for testing)."""
+    results = await run_daily_lunch_search()
+    return JSONResponse({"status": "ok", "suggestions": results})
 
 
 @app.get("/api/sessions")

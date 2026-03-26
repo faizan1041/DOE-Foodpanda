@@ -69,12 +69,30 @@ Then open http://localhost:8422
 FOODPANDA_PORT=8422  # optional, default 8422
 ```
 
+## Daily Lunch Assistant
+The agent also operates as a proactive lunch assistant. See `directives/daily_lunch_assistant.md` for full details.
+
+**Key features:**
+- Automatic restaurant search at 12:30 PM PKT via APScheduler
+- Smart scoring: ratings + variety + recency + deals
+- Desktop notifications via `notify-send`
+- Order history tracking in SQLite
+- Restaurant blacklisting for bad experiences
+- Repeats allowed every 3-4 days, never suggests blacklisted places
+
+**New agent actions:** `log_order`, `blacklist_restaurant`, `show_today_suggestions`
+
+**New execution scripts:**
+- `execution/lunch_db.py` - SQLite database (order history, blacklist, config)
+- `execution/lunch_scheduler.py` - Scoring algorithm and scheduled search
+
 ## Edge Cases & Learnings
 - **Location not found**: Foodpanda may not cover all areas. Bot suggests trying a different area.
 - **No restaurants**: Cuisine might not be available in that area. Bot prompts to try different cuisine.
 - **Menu scraping fails**: Restaurant pages vary in layout. Bot provides direct URL as fallback.
-- **Headless browser**: Runs without visible window. Uses `domcontentloaded` wait (not `networkidle`) to avoid timeouts.
 - **Session cleanup**: Idle sessions (30+ minutes) are automatically cleaned up.
+- **Server not running at 12:30**: Use `POST /api/trigger-lunch-search` to manually trigger.
+- **Order tracking**: Semi-manual — agent asks user what they ordered after checkout.
 
 ## Output
 - Conversational chat interface with food recommendations
@@ -82,3 +100,5 @@ FOODPANDA_PORT=8422  # optional, default 8422
 - Menu items with prices
 - Direct Foodpanda order links
 - Estimated cost per person for group orders
+- Daily lunch suggestions with smart scoring
+- Desktop notifications at lunch time

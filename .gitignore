@@ -8,6 +8,9 @@ token.json
 *.pyc
 __pycache__/
 
+# Database
+*.db
+
 # OS files
 .DS_Store
 

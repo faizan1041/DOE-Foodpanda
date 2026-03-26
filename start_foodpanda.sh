@@ -24,19 +24,9 @@ mkdir -p .tmp
 
 # Check dependencies
 echo "Checking dependencies..."
-python3 -c "import fastapi, uvicorn, playwright" 2>/dev/null || {
+python3 -c "import fastapi, uvicorn, httpx, anthropic, apscheduler" 2>/dev/null || {
     echo "Installing Python dependencies..."
-    pip install fastapi uvicorn playwright 2>/dev/null || pip3 install fastapi uvicorn playwright
-}
-
-# Check Playwright browsers
-python3 -c "
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    p.chromium.executable_path
-" 2>/dev/null || {
-    echo "Installing Playwright browsers..."
-    python3 -m playwright install chromium
+    pip install -r requirements.txt 2>/dev/null || pip3 install -r requirements.txt
 }
 
 PORT=${FOODPANDA_PORT:-8422}
@@ -49,8 +39,8 @@ echo ""
 echo "  Chat UI:   http://localhost:$PORT"
 echo "  API:       http://localhost:$PORT/api/chat"
 echo ""
-echo "  The bot will open Foodpanda in a headless"
-echo "  browser to find food options for you."
+echo "  Daily lunch search: 12:30 PM PKT"
+echo "  Desktop notifications enabled"
 echo ""
 
 cd execution
