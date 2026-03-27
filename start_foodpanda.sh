@@ -24,7 +24,7 @@ mkdir -p .tmp
 
 # Check dependencies
 echo "Checking dependencies..."
-python3 -c "import fastapi, uvicorn, httpx, anthropic, apscheduler" 2>/dev/null || {
+python3 -c "import fastapi, uvicorn, httpx, apscheduler" 2>/dev/null || {
     echo "Installing Python dependencies..."
     pip install -r requirements.txt 2>/dev/null || pip3 install -r requirements.txt
 }

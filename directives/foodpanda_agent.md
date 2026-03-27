@@ -1,62 +1,48 @@
 # Directive: Foodpanda Ordering Agent
 
 ## Goal
-Conversational chatbot that helps users find food on Foodpanda Pakistan. Asks for preferences (cuisine, party size, location), scrapes Foodpanda via headless browser, ranks restaurants by rating, and presents the best options with prices and deals.
+Food ordering assistant for Foodpanda Pakistan with a clean separation between intelligence and execution.
 
-## Inputs
-- **Cuisine preference**: What the user is in the mood for (desi, chinese, pizza, etc.)
-- **Party size**: Number of people ordering
-- **Delivery area**: User's location in Pakistan (e.g. F-7 Islamabad, Gulberg Lahore)
+**Philosophy:** This is a DOE (Department of Efficiency) agent. The architecture separates concerns:
+- **Repetitive execution** (searching, scoring, scheduling, logging, blacklisting) = deterministic Python scripts. No LLM needed.
+- **User interaction** (understanding intent, presenting results, having a conversation) = Claude Code CLI (`claude -p`). Uses existing subscription, zero API keys.
+- **Automated daily flow** (12:30 PM suggestions, scoring, notifications) = fully deterministic, runs on a cron with zero LLM involvement.
 
-## Conversation Flow
+## How It Works
 
-### Step 1: Greeting
-Bot asks what the user is in the mood for.
+### Chat Layer (Claude Code CLI)
+The chat UI calls `claude -p` (subprocess) to understand natural language. Uses the existing Claude Code subscription -- no API keys. Users can say anything:
+- "Check if Ginyaki is available" -- Claude understands the intent, searches
+- "Something spicy near F-7" -- Claude maps this to a search
+- "I ordered chicken biryani and raita" -- Claude logs the order
+- "That place was terrible, don't show it again" -- Claude blacklists it
 
-### Step 2: Cuisine
-User says cuisine type. Bot maps it to a Foodpanda category:
-- "desi" / "pakistani" / "karahi" / "nihari" / "paratha" → Desi
-- "chinese" / "asian" → Chinese
-- "pizza" / "italian" → Pizza/Italian
-- "burger" / "fast food" → Fast Food
-- "biryani" → Biryani
-- "bbq" / "tikka" / "seekh" / "grill" → BBQ
-- "dessert" / "sweet" / "mithai" / "ice cream" → Desserts
+Claude responds with JSON action blocks that the server executes deterministically. The LLM never scrapes or writes to the database directly.
 
-### Step 3: Party Size
-Bot asks how many people. Accepts numbers or words ("five" = 5).
+### Tools (called by Claude)
+- `search_restaurants(location, cuisine?)` -- scrape Foodpanda API, rank results
+- `load_menu(restaurant_number)` -- scrape menu for a restaurant
+- `open_restaurant(restaurant_number)` -- open in browser for checkout
+- `log_order(restaurant_name, items, cuisine?)` -- save to SQLite
+- `blacklist_restaurant(restaurant_name, reason?)` -- block forever
+- `get_today_suggestions()` -- return pre-computed daily picks
+- `get_order_history(days?)` -- return recent orders
+- `get_blacklist()` -- return blocked restaurants
 
-### Step 4: Location
-Bot asks delivery area. User provides area + city.
-
-### Step 5: Search
-Bot opens Foodpanda in headless browser:
-1. Navigate to foodpanda.pk
-2. Set delivery location (via address input or URL parameter)
-3. Search for cuisine type
-4. Scroll and scrape restaurant listings
-5. Extract: name, rating, delivery time, delivery fee, cuisine tags, deal badges, URL
-
-### Step 6: Rank & Present
-- Filter out restaurants with rating < 3.0
-- Score: (rating × 20) + deal bonus (15 points) - unknown rating penalty
-- Sort by score descending
-- Show top 8 as clickable cards with rating, delivery time, and deal info
-- For groups of 4+, suggest looking for family/deal combos
-
-### Step 7: Menu (optional)
-User picks a restaurant number. Bot scrapes the menu:
-- Item names, prices, descriptions
-- Calculates estimated cost per person for the group
-- Provides direct Foodpanda link to order
-
-### Step 8: Order
-User says "order" → bot provides the direct Foodpanda URL.
+### Flow
+1. User opens chat -- sees today's suggestions or a greeting
+2. User says what they want in natural language
+3. Claude understands intent, calls the right tools
+4. Tools do the work (deterministic), return results
+5. Claude presents results naturally to the user
+6. After ordering, Claude asks what they got and logs it
 
 ## Execution Scripts
-- `execution/foodpanda_server.py` - FastAPI chat UI server (port 8422)
-- `execution/foodpanda_agent.py` - Conversation state machine, ranking, orchestration
+- `execution/foodpanda_server.py` - FastAPI server (port 8422), runs lunch search on startup
+- `execution/foodpanda_agent.py` - Claude Code CLI for chat understanding, deterministic tool execution
 - `execution/foodpanda_browser.py` - Playwright automation for foodpanda.pk
+- `execution/lunch_db.py` - SQLite persistence (orders, blacklist, config, suggestions)
+- `execution/lunch_scheduler.py` - Scoring algorithm and scheduled search
 
 ## Start Command
 ```bash
@@ -69,36 +55,32 @@ Then open http://localhost:8422
 FOODPANDA_PORT=8422  # optional, default 8422
 ```
 
-## Daily Lunch Assistant
-The agent also operates as a proactive lunch assistant. See `directives/daily_lunch_assistant.md` for full details.
+No API keys needed. Chat uses `claude -p` (Claude Code CLI) which uses the existing subscription.
 
-**Key features:**
+## Daily Lunch Assistant
+See `directives/daily_lunch_assistant.md` for full details.
+
 - Automatic restaurant search at 12:30 PM PKT via APScheduler
+- Also runs immediately on server startup
 - Smart scoring: ratings + variety + recency + deals
 - Desktop notifications via `notify-send`
 - Order history tracking in SQLite
-- Restaurant blacklisting for bad experiences
-- Repeats allowed every 3-4 days, never suggests blacklisted places
-
-**New agent actions:** `log_order`, `blacklist_restaurant`, `show_today_suggestions`
-
-**New execution scripts:**
-- `execution/lunch_db.py` - SQLite database (order history, blacklist, config)
-- `execution/lunch_scheduler.py` - Scoring algorithm and scheduled search
+- Restaurant blacklisting
 
 ## Edge Cases & Learnings
-- **Location not found**: Foodpanda may not cover all areas. Bot suggests trying a different area.
-- **No restaurants**: Cuisine might not be available in that area. Bot prompts to try different cuisine.
-- **Menu scraping fails**: Restaurant pages vary in layout. Bot provides direct URL as fallback.
-- **Session cleanup**: Idle sessions (30+ minutes) are automatically cleaned up.
+- **Location not found**: Foodpanda may not cover all areas. Agent suggests trying a different area.
+- **No restaurants**: Cuisine might not be available. Agent prompts to try different cuisine.
+- **Menu scraping fails**: Restaurant pages vary. Agent provides direct URL as fallback.
+- **Session cleanup**: Idle sessions (30+ minutes) auto-cleaned.
 - **Server not running at 12:30**: Use `POST /api/trigger-lunch-search` to manually trigger.
-- **Order tracking**: Semi-manual — agent asks user what they ordered after checkout.
+- **DHA ambiguity**: "DHA" alone won't resolve -- user must specify "DHA Lahore" or "DHA Karachi".
+- **Claude Code CLI not found**: Ensure `claude` is in PATH. Install via `npm install -g @anthropic-ai/claude-code`.
+- **Unrecognized input**: Claude handles it conversationally -- no rigid pattern matching.
 
 ## Output
-- Conversational chat interface with food recommendations
+- Command-driven chat interface with food search
 - Restaurant cards with ratings, delivery times, deals
 - Menu items with prices
 - Direct Foodpanda order links
-- Estimated cost per person for group orders
 - Daily lunch suggestions with smart scoring
 - Desktop notifications at lunch time
